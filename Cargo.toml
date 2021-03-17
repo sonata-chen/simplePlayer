@@ -1,0 +1,15 @@
+[package]
+name = "simplePlayer"
+version = "0.1.0"
+authors = ["sonata-chen <sonatachen39@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# cpal = "0.12.0"
+jack = "0.6"
+tuix = { git = "https://github.com/geom3trik/tuix", branch = "main" }
+# ffmpeg-sys = { version = "4", features = ["build"] }
+ffmpeg = "0.3.0"
+crossbeam = "0.8.0"
