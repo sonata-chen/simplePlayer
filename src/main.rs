@@ -1,4 +1,5 @@
 #![allow(non_snake_case)]
+#![allow(unused_imports)]
 // use cpal::{Data, Sample, SampleFormat};
 //
 // fn main() {
@@ -36,18 +37,27 @@
 // }
 
 // use crossbeam::channel::bounded;
-use ffmpeg::codec::context::Context;
-use ffmpeg::format;
-use ffmpeg::format::stream::Stream;
-use ffmpeg::util::frame;
+use ffmpeg_next::codec::context::Context as CodecContext;
+use ffmpeg_next::codec::decoder;
+use ffmpeg_next::format;
+use ffmpeg_next::format::sample::Type::{Packed, Planar};
+use ffmpeg_next::format::stream::Stream;
+use ffmpeg_next::format::Sample as SampleType;
+use ffmpeg_next::packet::Ref;
+use ffmpeg_next::software::resampler;
+use ffmpeg_next::util::channel_layout::ChannelLayout;
+use ffmpeg_next::util::error::Error;
+use ffmpeg_next::util::frame;
 use std::io;
+use std::vec::Vec;
 
 fn main() -> io::Result<()> {
-    // let filename = String::from("res/An Ordinary Day-My Mister.mp3");
-    let filename = String::from("res/loop05.wav");
+    let filename = String::from("res/An Ordinary Day-My Mister.mp3");
+    // let filename = String::from("res/loop05.mp3");
+    // let filename = String::from("res/loop05.wav");
 
     // init ffmpeg
-    ffmpeg::init().unwrap();
+    ffmpeg_next::init().unwrap();
 
     // set up an AVFormatContext
     let mut input_ctx = format::input(&filename).unwrap();
@@ -58,7 +68,7 @@ fn main() -> io::Result<()> {
     println!("file format info: {}", input.description());
 
     // set up an AVCodecContext
-    let mut codec_ctx = Context::new();
+    let mut codec_ctx = CodecContext::new();
 
     // get Audio Stream
     let stream: Stream;
@@ -75,31 +85,34 @@ fn main() -> io::Result<()> {
 
     println!("[codec] samplerate: {}", decoder.rate());
     println!("[codec] number of channels: {}", decoder.channels());
+    println!("[codec] channel layout: {:?}", decoder.channel_layout());
     println!("[codec] name: {}", decoder.codec().unwrap().name());
     println!("[codec] info: {}", decoder.codec().unwrap().description());
+
+    let preferd_sample_format = SampleType::F32(Planar);
+    let preferd_channle_layout = ChannelLayout::STEREO;
+    decoder.request_format(preferd_sample_format);
+    // decoder.set_channel_layout(ChannelLayout::STEREO);
+    let mut _resampler_ctx = decoder
+        .resampler(preferd_sample_format, ChannelLayout::STEREO, 48000)
+        .unwrap();
 
     // write decoded (raw) audio data into buffer
     let mut output1: Vec<f32> = Vec::new();
     let mut output2: Vec<f32> = Vec::new();
+    let mut _bof = frame::audio::Audio::empty();
     let mut of = frame::audio::Audio::empty();
     let mut raw_data = input_ctx.packets();
     while let Some(packet) = raw_data.next() {
-        if let Ok(true) = decoder.decode(&packet.1, &mut of) {
-            let iter = of.data(0).chunks(8);
-            let mut array: [u8; 4];
-            let mut f: f32;
-
-            for item in iter {
-                array = [item[0], item[1], item[2], item[3]];
-                f = f32::from_le_bytes(array);
-                output1.push(f);
-
-                array = [item[4], item[5], item[6], item[7]];
-                f = f32::from_le_bytes(array);
-                output2.push(f);
-            }
-        }
+        decoder.send_packet(&packet.1).unwrap();
+        decode(&mut decoder, &mut of, &mut output1, &mut output2);
+        /* read all the output frames (in general there may be any number of them */
     }
+    decoder.send_eof().unwrap();
+    decode(&mut decoder, &mut of, &mut output1, &mut output2);
+    println!("{}", output1.len());
+    println!("{}", output2.len());
+
     let mut i = 0;
 
     // 1. open a client
@@ -115,7 +128,8 @@ fn main() -> io::Result<()> {
         .unwrap();
 
     // 3. define process callback handler
-    let _sample_rate = client.sample_rate();
+    let sample_rate = client.sample_rate();
+    println!("{}", sample_rate);
     let process = jack::ClosureProcessHandler::new(
         move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
             // Get output buffer
@@ -149,4 +163,45 @@ fn main() -> io::Result<()> {
 
     println!("{}", i);
     Ok(())
+}
+
+fn decode(
+    decoder: &mut decoder::audio::Audio,
+    of: &mut frame::audio::Audio,
+    output1: &mut Vec<f32>,
+    output2: &mut Vec<f32>,
+) {
+    loop {
+        let ret = decoder.receive_frame(of);
+
+        match ret {
+            Err(Error::Other { errno: _EAGAIN }) => {
+                // println!("EAGAIN");
+                break;
+            }
+            Err(Error::Eof) => {
+                // println!("Eof");
+                break;
+            }
+            Ok(()) => {
+                let left = of.data(0).chunks(4);
+                let right = of.data(1).chunks(4);
+                // let stereo = left.zip(right);
+                let mut array: [u8; 4];
+                let mut f: f32;
+
+                for l in left {
+                    array = [l[0], l[1], l[2], l[3]];
+                    f = f32::from_le_bytes(array);
+                    output1.push(f);
+                }
+                for r in right {
+                    array = [r[0], r[1], r[2], r[3]];
+                    f = f32::from_le_bytes(array);
+                    output2.push(f);
+                }
+            }
+            _ => panic!("error"),
+        }
+    }
 }
