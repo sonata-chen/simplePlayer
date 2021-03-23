@@ -36,18 +36,20 @@
 //     }
 // }
 
-// use crossbeam::channel::bounded;
-use ffmpeg_next::codec::context::Context as CodecContext;
-use ffmpeg_next::codec::decoder;
+use ffmpeg_next::codec::Context as CodecContext;
+use ffmpeg_next::decoder;
 use ffmpeg_next::format;
-use ffmpeg_next::format::sample::Type::{Packed, Planar};
 use ffmpeg_next::format::stream::Stream;
+use ffmpeg_next::frame;
+
+use ffmpeg_next::format::sample::Type::{Packed, Planar};
 use ffmpeg_next::format::Sample as SampleType;
-use ffmpeg_next::packet::Ref;
+use ffmpeg_next::ChannelLayout;
+
 use ffmpeg_next::software::resampler;
-use ffmpeg_next::util::channel_layout::ChannelLayout;
-use ffmpeg_next::util::error::Error;
-use ffmpeg_next::util::frame;
+
+use ffmpeg_next::Error;
+
 use std::io;
 use std::vec::Vec;
 
@@ -166,8 +168,8 @@ fn main() -> io::Result<()> {
 }
 
 fn decode(
-    decoder: &mut decoder::audio::Audio,
-    of: &mut frame::audio::Audio,
+    decoder: &mut decoder::Audio,
+    of: &mut frame::Audio,
     output1: &mut Vec<f32>,
     output2: &mut Vec<f32>,
 ) {
