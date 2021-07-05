@@ -3,9 +3,10 @@ use rsmpeg::{
     self,
     avcodec::{AVCodec, AVCodecContext},
     avformat::AVFormatContextInput,
-    swresample::SwrContext,
+    avutil::{av_get_channel_layout_nb_channels, get_bytes_per_sample, is_planar, AVSamples},
     error::RsmpegError,
     ffi,
+    swresample::SwrContext,
 };
 use std::ffi::CStr;
 use std::slice::from_raw_parts_mut;
@@ -31,6 +32,7 @@ pub fn create_a_player() -> (Controller, Player) {
         Player {
             file_name: String::new(),
             decoder: None,
+            sample_rate: 0,
             state: State::Stopped,
             rx,
         },
@@ -54,6 +56,7 @@ impl Controller {
 pub struct Player {
     file_name: String,
     decoder: Option<Decoder>,
+    sample_rate: u32,
     state: State,
     rx: Consumer<Command>,
 }
@@ -72,7 +75,12 @@ impl Player {
     }
     pub fn render_next_block(&mut self, context: &mut PlaybackContext) {
         match self.rx.pop() {
-            Some(Command::Open(f)) => self.open(&f),
+            Some(Command::Open(f)) => {
+                self.open(&f);
+                if let Some(ref mut d) = self.decoder {
+                    d.sample_rate(context.sample_rate);
+                }
+            }
             Some(Command::Play) => {
                 if self.decoder.is_some() {
                     self.state = State::Playing;
@@ -102,6 +110,7 @@ struct Decoder {
     input_format_context: Option<AVFormatContextInput>,
     codec_context: Option<AVCodecContext>,
     resampler: Option<SwrContext>,
+    samples: Option<AVSamples>,
     index_of_stream: Option<usize>,
     buffer: [f32; 4096],
     read_index: usize,
@@ -145,6 +154,7 @@ impl Decoder {
             input_format_context: Some(input_format_context),
             codec_context: decode_context,
             resampler: None,
+            samples: None,
             index_of_stream,
             buffer: [0.0f32; 4096],
             read_index: 0,
@@ -152,12 +162,44 @@ impl Decoder {
         }
     }
 
+    fn sample_rate(&mut self, sample_rate: u32) {
+        if let Some(d) = self.codec_context.as_ref() {
+            self.resampler = SwrContext::new(
+                ffi::AV_CH_LAYOUT_STEREO.into(),
+                ffi::AVSampleFormat_AV_SAMPLE_FMT_FLT,
+                sample_rate as i32,
+                if d.channel_layout == 0 {
+                    (unsafe { ffi::av_get_default_channel_layout(d.channels) }) as u64
+                } else {
+                    d.channel_layout
+                },
+                d.sample_fmt,
+                d.sample_rate,
+            );
+
+            if let Some(ref mut r) = self.resampler {
+                r.init().unwrap();
+            }
+
+            self.samples = AVSamples::new(
+                av_get_channel_layout_nb_channels(ffi::AV_CH_LAYOUT_STEREO.into()),
+                4096,
+                ffi::AVSampleFormat_AV_SAMPLE_FMT_FLT,
+                0,
+            );
+        }
+    }
+
     fn decode_to_buffer(&mut self, output: &mut [f32], length: usize) -> usize {
         let mut i = 0 as usize;
-        if let (Some(d), Some(f)) = (
-            self.codec_context.as_mut(),
-            self.input_format_context.as_mut(),
+        if let (Some(d), Some(f), Some(r), Some(s)) = (
+            &mut self.codec_context,
+            &mut self.input_format_context,
+            &mut self.resampler,
+            &mut self.samples,
         ) {
+            let bytes_per_sample = get_bytes_per_sample(d.sample_fmt).unwrap();
+            let nb_channels = d.channels;
             while i < length && self.read_index != self.write_index {
                 output[i] = self.buffer[self.read_index];
                 i += 1;
@@ -175,10 +217,7 @@ impl Decoder {
                         let ret = d.send_packet(None);
                         match ret {
                             Ok(()) => {}
-                            Err(RsmpegError::DecoderFlushedError) => {
-                                println!("already flushed");
-                                break;
-                            }
+                            Err(RsmpegError::DecoderFlushedError) => break,
                             _ => panic!("{:?}", ret),
                         }
                     }
@@ -188,23 +227,33 @@ impl Decoder {
                     let frame = d.receive_frame();
                     match frame {
                         Ok(mut f) => {
-                            let data = unsafe {
-                                from_raw_parts_mut(f.data_mut()[0], f.linesize_mut()[0] as usize)
-                            }
-                            .chunks(4);
+                            let ptr = f.data_mut().as_ptr() as *const *const u8;
 
-                            for d in data {
-                                let sample = f32::from_le_bytes([d[0], d[1], d[2], d[3]]);
-                                if i < length {
-                                    output[i] = sample;
-                                } else {
-                                    self.buffer[self.write_index] = sample;
-                                    self.write_index += 1;
-                                    if self.write_index >= 4096 {
-                                        self.write_index = self.write_index - 4096;
+                            let buffer_size_per_channel = if is_planar(f.format) {
+                                f.linesize_mut()[0] / bytes_per_sample
+                            } else {
+                                f.linesize_mut()[0] / nb_channels / bytes_per_sample
+                            };
+                            let ret = unsafe { r.convert(s, ptr, buffer_size_per_channel) };
+                            match ret {
+                                Ok(n) => {
+                                    let n = (n as usize) * 2 * 4;
+                                    let data = unsafe { from_raw_parts_mut(s.audio_data[0], n) };
+                                    for d in data.chunks(4) {
+                                        let sample = f32::from_le_bytes([d[0], d[1], d[2], d[3]]);
+                                        if i < length {
+                                            output[i] = sample;
+                                            i += 1;
+                                        } else {
+                                            self.buffer[self.write_index] = sample;
+                                            self.write_index += 1;
+                                            if self.write_index >= 4096 {
+                                                self.write_index = self.write_index - 4096;
+                                            }
+                                        }
                                     }
                                 }
-                                i += 1;
+                                _ => panic!("convert"),
                             }
                         }
                         Err(RsmpegError::DecoderDrainError) => break,
@@ -216,4 +265,61 @@ impl Decoder {
         }
         i
     }
+}
+
+#[test]
+fn decode() {
+    use cpal::traits::DeviceTrait;
+    use cpal::traits::HostTrait;
+    use cpal::traits::StreamTrait;
+    use cstr::cstr;
+    // let file_name = cstr!("test.mp3");
+    let file_name = cstr!("loop05.wav");
+    let mut d = Decoder::open(file_name);
+    d.sample_rate(44100);
+    let mut output: Vec<f32> = Vec::new();
+    let mut i = 0;
+    loop {
+        output.extend_from_slice(&[0.0; 2000]);
+        println!("{:?}", output.len());
+        let len = d.decode_to_buffer(&mut output[i..], 2000);
+        println!("{}", len);
+        i += len;
+        if len == 0 {
+            break;
+        }
+    }
+
+    let mut i = 0;
+    let host = cpal::default_host();
+    let output_device = host.default_output_device().expect("no output found");
+    let config = output_device
+        .default_output_config()
+        .expect("no default output config")
+        .config();
+
+    let sample_rate = config.sample_rate.0 as u32;
+    println!("config: {}", sample_rate);
+    let num_channels = config.channels as u32;
+    println!("channels: {}", num_channels);
+
+    let callback = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+        for sample in data.iter_mut() {
+            *sample = 0.0;
+        }
+
+        for d in data {
+            *d = output[i];
+            i += 1;
+        }
+    };
+
+    let stream = output_device
+        .build_output_stream(&config, callback, |err| eprintln!("{}", err))
+        .expect("failed to open stream");
+    stream.play().unwrap();
+
+    let mut buffer = String::new();
+    let stdin = std::io::stdin();
+    stdin.read_line(&mut buffer).unwrap();
 }

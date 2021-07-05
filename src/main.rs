@@ -20,7 +20,18 @@ fn main() {
     c.play();
 
     // event loop
-    let mut buffer = String::new();
     let stdin = io::stdin();
-    stdin.read_line(&mut buffer).unwrap();
+    let mut flag = true;
+    loop {
+        let mut buffer = String::new();
+        stdin.read_line(&mut buffer).unwrap();
+        if buffer == "p\n" {
+            if flag == true {
+                c.pause();
+            } else {
+                c.play();
+            }
+            flag = !flag;
+        }
+    }
 }
